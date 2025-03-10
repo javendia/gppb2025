@@ -1,0 +1,81 @@
+trigger: none
+
+pool:
+  name: default
+
+variables:
+ - group: variables
+
+stages:
+ - stage: unit_tests
+   jobs:
+    - job: test_entities
+      steps:
+        - task: PowerShell@2
+          displayName: 'Get notebook id'
+          inputs:
+            targetType: inline
+            script: |     
+              $SecureStringPwd = ConvertTo-SecureString $(servicePrincipalKey) -AsPlainText -Force
+              $pscredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $(servicePrincipalId), $SecureStringPwd
+                          
+              Connect-AzAccount -ServicePrincipal -Credential $pscredential -Tenant $(tenantId)
+
+              # Get authentication
+              $fabricToken = (Get-AzAccessToken -ResourceUrl $(resourceUrl)).Token
+
+              Write-Host "##vso[task.setvariable variable=fabricToken;]$fabricToken"
+
+              $apiUrl = "https://api.fabric.microsoft.com/v1/workspaces/$(workspaceId)/notebooks"
+              $headers = @{
+                "Authorization" = "Bearer $fabricToken"
+                "Content-Type"  = "application/json"
+              }
+
+              $list = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method GET
+              $notebookId = ($list.value | Where-Object {$_.displayName -eq "$(notebookName)"}).id
+              Write-Host "##vso[task.setvariable variable=notebookId;]$notebookId"
+        - task: PowerShell@2
+          displayName: 'Run Microsoft Fabric notebook'
+          inputs:
+            targetType: inline
+            script: |
+              $startnotebookUrl = "https://api.fabric.microsoft.com/v1/workspaces/$(workspaceId)/items/$(notebookId)/jobs/instances?jobType=RunNotebook"
+              $headers = @{
+                "Authorization" = "Bearer $(fabricToken)"
+                "Content-Type"  = "application/json"
+              }
+
+              Invoke-RestMethod -Uri $startnotebookUrl -Headers $headers -Method POST -ResponseHeadersVariable headers
+
+              $statusUrl = $headers.location[0]
+              Write-Host "##vso[task.setvariable variable=statusUrl;]$statusUrl"
+            pwsh: true
+        - task: PowerShell@2
+          displayName: 'Check status'
+          inputs:
+            targetType: inline
+            script: |
+              $headers = @{
+                "Authorization" = "Bearer $(fabricToken)"
+                "Content-Type"  = "application/json"
+              }
+                          
+              # Write-Host $(statusUrl)
+
+              $status = (Invoke-RestMethod -Uri $(statusUrl) -Headers $headers).status
+              
+              while ($status -ne 'completed' -and $status -ne 'Failed') {
+                Write-Host "Current status: $status. Waiting for notebook to be completed..."
+                Start-Sleep -Seconds 10 
+                $status = (Invoke-RestMethod -Uri $(statusUrl) -Headers $headers).status
+              }
+
+              if ($status -eq 'completed') {
+                Write-Output "Notebook has completed running."
+              } else {
+                Write-Output "Notebook has failed, probably due to an assertion failure. Check the stdout log for assertion failure."
+
+                exit 1
+              }
+            pwsh: true
